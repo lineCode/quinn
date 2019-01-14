@@ -1,12 +1,13 @@
+#![feature(await_macro, async_await, futures_api)]
 use std::net::ToSocketAddrs;
 use std::str;
 use std::sync::{Arc, Mutex};
 
-use futures::Future;
+use futures::TryFutureExt;
 use structopt::StructOpt;
 use tokio::runtime::current_thread::Runtime;
 
-use failure::{format_err, Error};
+use failure::{format_err, Error, ResultExt};
 use slog::{o, Drain, Logger};
 
 type Result<T> = std::result::Result<T, Error>;
@@ -73,57 +74,43 @@ fn run(log: Logger, options: Opt) -> Result<()> {
 
     builder.logger(log.clone());
     let (endpoint, driver, _) = builder.bind("[::]:0")?;
-    runtime.spawn(driver.map_err(|e| eprintln!("IO error: {}", e)));
+    runtime.spawn(driver.map_err(|e| panic!("IO error: {}", e)).compat());
 
     let mut handshake = false;
     let mut stream_data = false;
     let mut close = false;
     let mut resumption = false;
     let mut key_update = false;
-    let result = runtime.block_on(
-        endpoint
-            .connect_with(&client_config, &remote, &options.host)?
-            .map_err(|e| format_err!("failed to connect: {}", e))
-            .and_then(|conn| {
+    let result: Result<()> = runtime.block_on(
+        Box::pin(
+            async {
+                let conn = endpoint.connect_with(&client_config, &remote, &options.host)?;
+                let (conn, _) = await!(conn.establish()).context("failed to connect")?;
                 println!("connected");
                 assert!(state.lock().unwrap().saw_cert);
                 handshake = true;
-                let conn = conn.connection;
-                let stream = conn.open_bi();
-                let stream_data = &mut stream_data;
-                stream
-                    .map_err(|e| format_err!("failed to open stream: {}", e))
-                    .and_then(move |stream| get(stream))
-                    .and_then(move |data| {
-                        println!("read {} bytes, closing", data.len());
-                        *stream_data = true;
-                        conn.close(0, b"done").map_err(|_| unreachable!())
-                    })
-                    .map(|()| {
-                        close = true;
-                    })
-            })
-            .and_then(|_| {
+                let stream = await!(conn.open_bi()).context("failed to open stream")?;
+                let data = await!(get(stream)).context("request failed")?;
+                println!("read {} bytes, closing", data.len());
+                stream_data = true;
+                await!(conn.close(0, b"done"));
+                close = true;
+
                 println!("attempting resumption");
                 state.lock().unwrap().saw_cert = false;
-                endpoint
-                    .connect_with(&client_config, &remote, &options.host)
-                    .unwrap()
-                    .map_err(|e| format_err!("failed to connect: {}", e))
-                    .and_then(|conn| {
-                        resumption = !state.lock().unwrap().saw_cert;
-                        let conn = conn.connection;
-                        conn.force_key_update();
-                        let stream = conn.open_bi();
-                        stream
-                            .map_err(|e| format_err!("failed to open stream: {}", e))
-                            .and_then(move |stream| get(stream))
-                            .inspect(|_| {
-                                key_update = true;
-                            })
-                            .and_then(move |_| conn.close(0, b"done").map_err(|_| unreachable!()))
-                    })
-            }),
+                let conn = endpoint.connect_with(&client_config, &remote, &options.host)?;
+                let (conn, _) = await!(conn.establish()).context("failed to connect")?;
+                resumption = !state.lock().unwrap().saw_cert;
+                println!("updating keys");
+                conn.force_key_update();
+                let stream = await!(conn.open_bi()).context("failed to open stream")?;
+                await!(get(stream)).context("request failed")?;
+                key_update = true;
+                await!(conn.close(0, b"done"));
+                Ok(())
+            },
+        )
+        .compat(),
     );
     if let Err(e) = result {
         println!("failure: {}", e);
@@ -136,15 +123,17 @@ fn run(log: Logger, options: Opt) -> Result<()> {
             .to_socket_addrs()?
             .next()
             .ok_or(format_err!("couldn't resolve to an address"))?;
-        let result = runtime.block_on(
-            endpoint
-                .connect_with(&client_config, &remote, &options.host)?
-                .and_then(|conn| {
+        let result: Result<()> = runtime.block_on(
+            Box::pin(
+                async {
+                    let conn = endpoint.connect_with(&client_config, &remote, &options.host)?;
+                    let (conn, _) = await!(conn.establish()).context("failed to connect")?;
                     retry = true;
-                    conn.connection
-                        .close(0, b"done")
-                        .map_err(|_| unreachable!())
-                }),
+                    await!(conn.close(0, b"done"));
+                    Ok(())
+                },
+            )
+            .compat(),
         );
         if let Err(e) = result {
             println!("failure: {}", e);
@@ -175,17 +164,10 @@ fn run(log: Logger, options: Opt) -> Result<()> {
     Ok(())
 }
 
-fn get(stream: quinn::BiStream) -> impl Future<Item = Box<[u8]>, Error = Error> {
-    tokio::io::write_all(stream, b"GET /index.html\r\n".to_owned())
-        .map_err(|e| format_err!("failed to send request: {}", e))
-        .and_then(|(stream, _)| {
-            tokio::io::shutdown(stream).map_err(|e| format_err!("failed to shutdown stream: {}", e))
-        })
-        .and_then(move |stream| {
-            quinn::read_to_end(stream, usize::max_value())
-                .map_err(|e| format_err!("failed to read response: {}", e))
-        })
-        .map(|(_, data)| data)
+async fn get(mut stream: quinn::BiStream) -> Result<Box<[u8]>> {
+    await!(stream.send.write_all(b"GET /index.html\r\n")).context("writing request")?;
+    await!(stream.send.finish()).context("finishing stream")?;
+    Ok(await!(stream.recv.read_to_end(usize::max_value())).context("reading response")?)
 }
 
 struct InteropVerifier(Arc<Mutex<State>>);
