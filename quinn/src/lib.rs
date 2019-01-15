@@ -109,7 +109,11 @@ impl Endpoint {
     ///
     /// May fail immediately due to configuration errors, or in the future if the connection could
     /// not be established.
-    pub fn connect(&self, addr: &SocketAddr, server_name: &str) -> Result<Handshake, ConnectError> {
+    pub fn connect(
+        &self,
+        addr: &SocketAddr,
+        server_name: &str,
+    ) -> Result<ClientHandshake, ConnectError> {
         self.connect_with(&self.default_client_config, addr, server_name)
     }
 
@@ -122,7 +126,7 @@ impl Endpoint {
         config: &ClientConfig,
         addr: &SocketAddr,
         server_name: &str,
-    ) -> Result<Handshake, ConnectError> {
+    ) -> Result<ClientHandshake, ConnectError> {
         let mut inner = self.inner.lock().unwrap();
         let addr = if inner.ipv6 {
             SocketAddr::V6(ensure_ipv6(addr))
@@ -134,25 +138,52 @@ impl Endpoint {
             .connect(addr, &config.tls_config, server_name)?;
         let conn = Connection::new(self.inner.clone(), ch);
         let mut state = ConnState::new(Arc::downgrade(&conn.0));
-        let mut hs = Handshake::new(conn);
         let (send, recv) = oneshot::channel();
         state.connected = Some(send);
-        hs.connected = Some(recv);
         inner.insert(ch, state);
         inner.wake();
-        Ok(hs)
+        Ok(ClientHandshake::new(conn, recv))
     }
 }
 
-/// A connection in the process of becoming established
-pub struct Handshake {
+/// An outgoing connection that has not yet been established
+pub struct ClientHandshake {
     conn: Connection,
+    connected: oneshot::Receiver<()>,
+}
+
+impl ClientHandshake {
+    fn new(conn: Connection, connected: oneshot::Receiver<()>) -> Self {
+        Self { conn, connected }
+    }
+
+    /// Complete the handshake.
+    pub async fn establish(self) -> Result<(Connection, IncomingStreams), ConnectionError> {
+        await!(self.connected).unwrap();
+        self.conn.0.check_err()?;
+        self.conn.0.inner.lock().unwrap().check_err()?;
+        let incoming = IncomingStreams(self.conn.0.clone());
+        Ok((self.conn, incoming))
+    }
+
+    // TODO: 0-RTT
+
+    /// The peer's UDP address.
+    pub fn remote_address(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+}
+
+/// An outgoing connection that has not yet been established
+pub struct ServerHandshake {
+    conn: Connection,
+    /// If None, already connected
     connected: Option<oneshot::Receiver<()>>,
 }
 
-impl Handshake {
+impl ServerHandshake {
     fn new(conn: Connection) -> Self {
-        Handshake {
+        Self {
             conn,
             connected: None,
         }
@@ -160,16 +191,36 @@ impl Handshake {
 
     /// Complete the handshake.
     pub async fn establish(self) -> Result<(Connection, IncomingStreams), ConnectionError> {
-        if let Some(connected) = self.connected {
-            await!(connected).unwrap();
-        }
-        self.conn.0.check_err()?;
-        self.conn.0.inner.lock().unwrap().check_err()?;
-        let incoming = IncomingStreams(self.conn.0.clone());
-        Ok((self.conn, incoming))
+        let (conn, incoming) = self.into_half_rtt();
+        let incoming = await!(incoming)?;
+        Ok((conn, incoming))
     }
 
-    // TODO: 0/0.5-RTT
+    /// Convert into a [`Connection`] that can send 0.5-RTT data.
+    ///
+    /// Use with caution: 0.5-RTT data is sent before the absence of a man-in-the-middle attacker
+    /// has been confirmed.
+    ///
+    /// Additionally returns future that will yield the connection's [`IncomingStreams`] when the
+    /// connection is established.
+    pub fn into_half_rtt(
+        self,
+    ) -> (
+        Connection,
+        impl Future<Output = Result<IncomingStreams, ConnectionError>>,
+    ) {
+        let ServerHandshake { conn, connected } = self;
+        let incoming = IncomingStreams(conn.0.clone());
+        let fut = async move {
+            if let Some(connected) = connected {
+                await!(connected).unwrap();
+            }
+            incoming.0.check_err()?;
+            incoming.0.inner.lock().unwrap().check_err()?;
+            Ok(incoming)
+        };
+        (conn, fut)
+    }
 
     /// The peer's UDP address.
     pub fn remote_address(&self) -> SocketAddr {
@@ -1039,7 +1090,7 @@ impl From<ReadError> for io::Error {
 pub struct IncomingConnections(Arc<Mutex<EndpointInner>>);
 
 impl Stream for IncomingConnections {
-    type Item = Handshake;
+    type Item = ServerHandshake;
     fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
         let inner = &mut *self.0.lock().unwrap();
         if inner.check_err().is_err() {
@@ -1048,7 +1099,7 @@ impl Stream for IncomingConnections {
         if let Some(conn) = inner.incoming.pop_front() {
             inner.endpoint.accept();
             let ch = conn.0.ch;
-            let mut hs = Handshake::new(conn);
+            let mut hs = ServerHandshake::new(conn);
             if inner.endpoint.connection(ch).is_handshaking() {
                 let (send, recv) = oneshot::channel();
                 inner.conns[ch.0].as_mut().unwrap().connected = Some(send);
