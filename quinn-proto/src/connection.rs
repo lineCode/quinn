@@ -819,10 +819,7 @@ impl Connection {
         if self.state.is_closed() {
             return Ok(());
         }
-        let params = TransportParameters::read(
-            Side::Server,
-            &mut io::Cursor::new(self.tls.get_quic_transport_parameters().unwrap()),
-        )?;
+        let params = self.tls.transport_parameters()?.unwrap();
         self.set_params(params)?;
         self.write_tls();
         self.init_0rtt();
@@ -834,20 +831,20 @@ impl Connection {
 
     fn init_0rtt(&mut self) {
         if self.side.is_client() && self.tls.get_early_secret().is_some() {
-            let params = self
-                .tls
-                .get_quic_transport_parameters()
-                .expect("rustls didn't supply transport parameters with ticket");
-            if let Err(e) = TransportParameters::read(self.side, &mut io::Cursor::new(params))
-                .map_err(Into::into)
-                .and_then(|x| self.set_params(x))
-            {
-                error!(
-                    self.log,
-                    "session ticket had malformed transport parameters: {}", e
-                );
-                return;
-            }
+            self.tls
+                .transport_parameters()
+                .and_then(|params| {
+                    self.set_params(
+                        params.expect("rustls didn't supply transport parameters with ticket"),
+                    )
+                    .map_err(Into::into)
+                })
+                .unwrap_or_else(|e| {
+                    error!(
+                        self.log,
+                        "session ticket has malformed transport parameters: {}", e
+                    )
+                })
         }
         if let Some(secret) = self.tls.get_early_secret() {
             trace!(self.log, "0-RTT enabled");
@@ -1231,17 +1228,14 @@ impl Connection {
 
                         if self.side.is_client() {
                             // Client-only beceause server params were set from the client's Initial
-                            let params = self
-                                .tls
-                                .get_quic_transport_parameters()
-                                .ok_or_else(|| {
+                            let params = match self.tls.transport_parameters() {
+                                Ok(Some(params)) => Ok(params),
+                                Ok(None) => {
                                     debug!(self.log, "remote didn't send transport params");
-                                    ConnectionError::from(TransportError::PROTOCOL_VIOLATION)
-                                })
-                                .and_then(|x| {
-                                    TransportParameters::read(self.side, &mut io::Cursor::new(x))
-                                        .map_err(Into::into)
-                                })?;
+                                    Err(ConnectionError::from(TransportError::PROTOCOL_VIOLATION))
+                                }
+                                Err(e) => Err(e.into()),
+                            }?;
                             if self.has_0rtt()
                                 && (params.initial_max_data < self.params.initial_max_data
                                     || params.initial_max_stream_data_bidi_local
