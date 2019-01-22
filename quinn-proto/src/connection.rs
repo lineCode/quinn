@@ -10,7 +10,9 @@ use rand::{rngs::OsRng, Rng};
 use slog::Logger;
 
 use crate::coding::{BufExt, BufMutExt};
-use crate::crypto::{self, reset_token_for, Crypto, CryptoSession, HeaderCrypto, TlsSession, ACK_DELAY_EXPONENT};
+use crate::crypto::{
+    self, reset_token_for, Crypto, CryptoSession, HeaderCrypto, TlsSession, ACK_DELAY_EXPONENT,
+};
 use crate::dedup::Dedup;
 use crate::endpoint::{Config, Event, Timer};
 use crate::frame::FrameStruct;

@@ -65,7 +65,7 @@ impl<'a> EndpointBuilder<'a> {
         let rc = Rc::new(RefCell::new(EndpointInner {
             log: self.logger.clone(),
             socket,
-            inner: quinn::Endpoint::new(self.logger, self.config, self.server_config)?,
+            inner: quinn::Endpoint::new(self.logger, self.config, self.server_config),
             outgoing: None,
             epoch: Instant::now(),
             pending: FnvHashMap::default(),
@@ -133,15 +133,6 @@ pub enum EndpointError {
     /// Errors relating to web PKI infrastructure
     #[error(display = "webpki failed: {:?}", _0)]
     WebPki(webpki::Error),
-}
-
-impl From<quinn::EndpointError> for EndpointError {
-    fn from(x: quinn::EndpointError) -> Self {
-        use crate::quinn::EndpointError::*;
-        match x {
-            Tls(x) => EndpointError::Tls(x),
-        }
-    }
 }
 
 impl From<webpki::Error> for EndpointError {

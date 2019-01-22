@@ -118,9 +118,8 @@ impl Pair {
             log.new(o!("side" => "Server")),
             server_config,
             Some(listen_keys),
-        )
-        .unwrap();
-        let client = Endpoint::new(log.new(o!("side" => "Client")), client_config, None).unwrap();
+        );
+        let client = Endpoint::new(log.new(o!("side" => "Client")), client_config, None);
 
         let server_addr = SocketAddr::new(
             Ipv6Addr::LOCALHOST.into(),
@@ -371,8 +370,7 @@ fn version_negotiate() {
         log.new(o!("peer" => "server")),
         Config::default(),
         Some(server_config()),
-    )
-    .unwrap();
+    );
     server.handle(
         0,
         client_addr,
@@ -454,8 +452,7 @@ fn server_stateless_reset() {
             ..Config::default()
         },
         Some(server_config()),
-    )
-    .unwrap();
+    );
     // Send something big enough to allow room for a smaller stateless reset.
     pair.client
         .close(pair.time, client_ch, 42, (&[0xab; 128][..]).into());
@@ -487,8 +484,7 @@ fn client_stateless_reset() {
             ..Config::default()
         },
         Some(server_config()),
-    )
-    .unwrap();
+    );
     // Send something big enough to allow room for a smaller stateless reset.
     pair.server
         .close(pair.time, server_ch, 42, (&[0xab; 128][..]).into());

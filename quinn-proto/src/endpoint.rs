@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use err_derive::Error;
 use fnv::{FnvHashMap, FnvHashSet};
 use rand::{rngs::OsRng, Rng, RngCore};
 use ring::digest;
@@ -55,18 +54,14 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn new(
-        log: Logger,
-        config: Config,
-        server_config: Option<ServerConfig>,
-    ) -> Result<Self, EndpointError> {
+    pub fn new(log: Logger, config: Config, server_config: Option<ServerConfig>) -> Self {
         let rng = OsRng::new().unwrap();
         let config = Arc::new(config);
         assert!(
             (config.local_cid_len == 0 || config.local_cid_len >= MIN_CID_SIZE)
                 && config.local_cid_len <= MAX_CID_SIZE
         );
-        Ok(Self {
+        Self {
             log,
             rng,
             transmits: VecDeque::new(),
@@ -81,7 +76,7 @@ impl Endpoint {
             incoming_handshakes: 0,
             config,
             server_config,
-        })
+        }
     }
 
     fn is_server(&self) -> bool {
@@ -953,19 +948,6 @@ impl Default for ServerConfig {
 
             accept_buffer: 1024,
         }
-    }
-}
-
-/// Errors in the configuration of an endpoint
-#[derive(Debug, Error)]
-pub enum EndpointError {
-    #[error(display = "failed to configure TLS: {}", _0)]
-    Tls(crypto::TLSError),
-}
-
-impl From<crypto::TLSError> for EndpointError {
-    fn from(x: crypto::TLSError) -> Self {
-        EndpointError::Tls(x)
     }
 }
 
